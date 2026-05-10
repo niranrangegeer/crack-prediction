@@ -1,0 +1,27 @@
+# 训练输出
+outputs/
+SaveModel/
+Loss.txt
+test_output*.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+
+# Claude
+.claude/
