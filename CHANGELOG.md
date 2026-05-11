@@ -1,0 +1,68 @@
+# 更新日志
+
+## v3 — 2026-05-11（当前最新）
+
+### 新增功能
+
+| 特性 | 说明 |
+|------|------|
+| **自适应居中裁剪** | `center_square_crop()` — 在 resize 之前先将长方形 Abaqus 截图裁剪为最大中心正方形，裁掉左侧文字标签和右侧留白，**彻底解决直接 resize 导致的孔洞形状挤压变形问题** |
+| **裂纹加粗** | `thicken_status_image()` — 使用 OpenCV `cv2.erode` 对 Status 裂纹标签图做形态学腐蚀，将细裂纹线加粗，使模型更容易学到裂纹特征 |
+| **LSGAN 损失** | Discriminator 损失从 `BCELoss` 替换为 `MSELoss`（Least Squares GAN），训练更稳定，生成质量更高 |
+| **TTUR 学习率** | Generator lr=2e-4, Discriminator lr=5e-5（降低4倍），遵循 Two Time-scale Update Rule，防止判别器过强压倒生成器 |
+| **加权 L1 Loss** | 裂纹区域像素（归一化后 < 0 的像素）获得 **50倍** L1 权重，强制模型聚焦裂纹细节而非背景 |
+
+### 架构变更
+
+| 组件 | v1/v2 | v3 |
+|------|-------|-----|
+| Discriminator 输出层 | `Sigmoid()` | **无**（LSGAN 输出原始 logits） |
+| GAN Loss | `BCELoss` | **`MSELoss`** |
+| D 学习率 | 2e-4 | **5e-5**（TTUR） |
+| Label Smoothing | 0.9（v1有，v2无） | **无**（MSE 不需要） |
+| 预处理 | resize → crop/flip | **crop_center → resize → crop/flip** |
+| 新增依赖 | PIL, numpy, torch | **+ OpenCV (cv2)** |
+
+### 数据处理管线对比
+
+```
+v1/v2:  原图 → resize(直接拉伸,会变形) → random crop → flip → normalize
+v3:     原图 → center_square_crop(裁正方形) → resize(不变形) → random crop → flip → normalize
+              └─ Status额外: thicken(腐蚀加粗裂纹)
+```
+
+---
+
+## v2.2 — 2026-05-10
+
+### 修复
+- **内存暴涨修复**：`CrackDataset` 从预加载全部图片（`self._cached`）改为按需磁盘读取，避免多进程 worker 各自复制一份解码图像缓存
+- `NUM_WORKERS`: 8 → 2
+- `prefetch_factor`: 4 → 2
+
+---
+
+## v2.1 — 2026-05-10
+
+### 新增
+- Ctrl+C 优雅停止 + 断点续训（`save_checkpoint` / `load_checkpoint`）
+- 双进度条（epoch 级别 + batch 级别）
+- 内存预加载（`self._cached`）
+- AMP 混合精度（`GradScaler` + `autocast`）
+- 大批量训练（BATCH_SIZE=16, NUM_WORKERS=8）
+- 梯度累积框架（`ACCUM_STEPS`）
+- `torch.compile` 加速
+- 信号处理器（二次 Ctrl+C 强制退出）
+
+---
+
+## v1 — 2026-05-10
+
+### 基础功能
+- GAN + 全尺度跳跃连接 U-Net（pix2pix 架构）
+- 适配实际 Abaqus 文件命名（`J_Porosity_X_XXXX_slice_Y_geom/sener/status.png`）
+- tqdm 进度条
+- 断点续训（手动设置 `RESUME_TRAINING=True`）
+- 每 epoch 动态更新 Loss 曲线图
+- 每 50 epoch 保存可视化样本对比图（geom / sener / real / fake）
+- 安全 KeyboardInterrupt 保存
