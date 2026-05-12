@@ -33,21 +33,23 @@ OUTPUT_DIR = r"C:\Users\PS\Desktop\crack_prediction\机器学习+裂纹预测\co
 DATA_ROOT  = r"E:\ntop\Abaqus_Plots_v2"
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-USE_AMP = torch.cuda.is_available()  # CPU 不能用 autocast
+USE_AMP = torch.cuda.is_available()
 IMG_SIZE = 256
 
-# 上下文管理器：GPU 用 AMP 加速推理，CPU 直接跳过
 from contextlib import nullcontext
 def autocast_ctx():
     return torch.amp.autocast('cuda') if USE_AMP else nullcontext()
 
-# 要评估的模型文件（二选一）
-MODEL_FILE = "generator_best.pth"   # 训练中最佳
-# MODEL_FILE = "generator_final.pth"  # 训练结束最终
+# 要评估的模型（默认两个都跑）
+MODEL_FILES = ["generator_best.pth", "generator_final.pth"]
 
 # 评估样本数
-NUM_SAMPLES = 12  # 生成对比图的数量
-FULL_TEST   = True  # 是否计算全量测试集指标
+NUM_SAMPLES = 12
+FULL_TEST   = True
+
+# 时间戳（本次运行共用）
+from datetime import datetime
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # ============================================================
 # 1. 模型定义 (与训练代码一致)
@@ -193,50 +195,33 @@ def compute_ssim(img1, img2, K1=0.01, K2=0.03, win_size=11):
 # ============================================================
 # 4. 主程序
 # ============================================================
-if __name__ == '__main__':
-    print("=" * 60)
-    print("  裂纹预测模型评估")
-    print(f"  设备: {DEVICE}")
-    print(f"  模型: {MODEL_FILE}")
-    print("=" * 60)
+# ============================================================
+# 4. 主程序 — 依次评估所有模型
+# ============================================================
+def evaluate_one_model(model_name, all_pairs, vis_samples, output_dir):
+    """评估单个模型，返回汇总指标"""
+    model_path = os.path.join(SAVE_DIR, model_name)
+    model_label = model_name.replace(".pth", "").replace("generator_", "")
 
-    # ---- 4a. 加载模型 ----
-    model_path = os.path.join(SAVE_DIR, MODEL_FILE)
     if not os.path.exists(model_path):
-        print(f"[错误] 模型文件不存在: {model_path}")
-        print(f"  请确保训练完成后 SAVE_DIR 下有 {MODEL_FILE}")
-        sys.exit(1)
+        print(f"  [跳过] 模型文件不存在: {model_path}\n")
+        return None
 
+    # 加载模型
     gen = Generator().to(DEVICE)
-    state_dict = torch.load(model_path, map_location=DEVICE, weights_only=True)
-    gen.load_state_dict(state_dict)
+    gen.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
     gen.eval()
-    print(f"[模型] 已加载 {MODEL_FILE}\n")
+    print(f"  [模型] 已加载 {model_name}\n")
 
-    # ---- 4b. 收集数据 ----
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    all_pairs = collect_test_pairs()
-    print(f"[数据] 找到 {len(all_pairs)} 组测试数据")
-
-    # 随机选取 NUM_SAMPLES 做对比图
-    np.random.seed(42)
-    idx_vis = np.random.choice(len(all_pairs), min(NUM_SAMPLES, len(all_pairs)), replace=False)
-    vis_samples = [all_pairs[i] for i in idx_vis]
-
-    # ---- 4c. 生成对比图 ----
-    print(f"\n[可视化] 生成 {len(vis_samples)} 组对比图...")
-    n_cols = 6  # Geom | Sener | GT | Pred | Error×10 | diff_map
+    # ---- 对比图 ----
+    print(f"  [可视化] 生成 {len(vis_samples)} 组对比图...")
+    n_cols = 6
     fig, axes = plt.subplots(len(vis_samples), n_cols,
                               figsize=(n_cols * 3, len(vis_samples) * 3.2))
-
     if len(vis_samples) == 1:
         axes = axes.reshape(1, -1)
 
-    metrics_list = []
-
-    for row, (gf, sf, stf, pname) in enumerate(tqdm(vis_samples, desc="生成对比")):
-        # 读取并预处理
+    for row, (gf, sf, stf, pname) in enumerate(tqdm(vis_samples, desc=f"  {model_label}", leave=False)):
         geom_pil   = Image.open(gf).convert('RGB')
         sener_pil  = Image.open(sf).convert('RGB')
         status_pil = Image.open(stf).convert('RGB')
@@ -245,33 +230,24 @@ if __name__ == '__main__':
         sener_t  = preprocess_image(sener_pil).unsqueeze(0).to(DEVICE)
         status_t = preprocess_image(status_pil).unsqueeze(0)
 
-        # 推理
         with torch.no_grad():
             with autocast_ctx():
                 pred_t = gen(geom_t, sener_t).cpu()
 
-        # 反归一化
-        pred_np   = ((pred_t.squeeze(0).permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
-        real_np   = ((status_t.squeeze(0).permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
-        geom_np   = ((geom_t.cpu().squeeze(0).permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
-        sener_np  = ((sener_t.cpu().squeeze(0).permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
+        pred_np   = ((pred_t.squeeze(0).permute(1,2,0).numpy() + 1) * 127.5).clip(0,255).astype(np.uint8)
+        real_np   = ((status_t.squeeze(0).permute(1,2,0).numpy() + 1) * 127.5).clip(0,255).astype(np.uint8)
+        geom_np   = ((geom_t.cpu().squeeze(0).permute(1,2,0).numpy() + 1) * 127.5).clip(0,255).astype(np.uint8)
+        sener_np  = ((sener_t.cpu().squeeze(0).permute(1,2,0).numpy() + 1) * 127.5).clip(0,255).astype(np.uint8)
 
-        # 误差图 (取三通道均值, 放大10倍方便观察)
-        error_map = np.abs(pred_np.astype(np.float32) - real_np.astype(np.float32)).mean(axis=2)
+        error_map     = np.abs(pred_np.astype(np.float32) - real_np.astype(np.float32)).mean(axis=2)
         error_map_10x = (error_map * 10).clip(0, 255).astype(np.uint8)
 
-        # 差异叠加图: R通道=误差, G/B=预测
         diff_overlay = np.zeros_like(pred_np)
-        diff_overlay[:, :, 0] = error_map.clip(0, 255).astype(np.uint8)  # R
-        diff_overlay[:, :, 1:] = pred_np[:, :, 1:] * 0.5                   # 半透明预测
+        diff_overlay[:, :, 0] = error_map.clip(0, 255).astype(np.uint8)
+        diff_overlay[:, :, 1:] = pred_np[:, :, 1:] * 0.5
 
-        # 计算指标
-        metrics = compute_metrics(pred_np, real_np)
-        metrics_list.append(metrics)
-
-        # 填图
         titles = ['Geom (输入)', 'Sener (输入)', 'GT (真实裂纹)', 'Pred (预测)',
-                   'Error ×10', 'Diff Overlay']
+                   'Error x10', 'Diff Overlay']
         imgs   = [geom_np, sener_np, real_np, pred_np, error_map_10x, diff_overlay]
 
         for col, (title, img) in enumerate(zip(titles, imgs)):
@@ -279,22 +255,24 @@ if __name__ == '__main__':
             axes[row, col].set_title(title, fontsize=8)
             axes[row, col].axis('off')
 
-        # 第一列加孔隙率标签
-        axes[row, 0].set_ylabel(f'{pname}\nMAE={metrics["MAE"]:.1f}',
+        mae_sample = np.abs(pred_np.astype(np.float32) - real_np.astype(np.float32)).mean()
+        axes[row, 0].set_ylabel(f'{pname}\nMAE={mae_sample:.1f}',
                                 fontsize=7, rotation=0, labelpad=40)
 
+    plt.suptitle(f'模型: {model_name}  |  时间: {TIMESTAMP}', fontsize=10, y=1.01)
     plt.tight_layout(pad=0.5)
-    vis_path = os.path.join(OUTPUT_DIR, "evaluate_comparison.png")
+    vis_path = os.path.join(output_dir, f"evaluate_comparison_{model_label}_{TIMESTAMP}.png")
     plt.savefig(vis_path, dpi=120, bbox_inches='tight')
     plt.close()
-    print(f"[可视化] 对比图已保存: {vis_path}")
+    print(f"  [可视化] 对比图 -> {os.path.basename(vis_path)}")
 
-    # ---- 4d. 全量测试集评估 ----
+    # ---- 全量测试 ----
+    summary = None
     if FULL_TEST:
-        print(f"\n[评估] 计算全量测试集指标 ({len(all_pairs)} 张)...")
+        print(f"  [评估] 全量测试集 ({len(all_pairs)} 张)...")
         all_metrics = {'MAE': [], 'MSE': [], 'PSNR': [], 'SSIM': []}
 
-        for gf, sf, stf, _ in tqdm(all_pairs, desc="全量评估"):
+        for gf, sf, stf, _ in tqdm(all_pairs, desc=f"  {model_label}", leave=False):
             geom_pil   = Image.open(gf).convert('RGB')
             sener_pil  = Image.open(sf).convert('RGB')
             status_pil = Image.open(stf).convert('RGB')
@@ -314,62 +292,135 @@ if __name__ == '__main__':
             for k in all_metrics:
                 all_metrics[k].append(m[k])
 
-        # ---- 汇总 ----
-        print(f"\n{'='*60}")
-        print(f"  全量测试集评估结果 ({len(all_pairs)} 张)")
-        print(f"{'='*60}")
+        summary = {k: {
+            'mean': np.mean(v), 'std': np.std(v),
+            'min': np.min(v), 'max': np.max(v)
+        } for k, v in all_metrics.items()}
+
+        # 打印（带模型标签）
+        print(f"\n  {'='*56}")
+        print(f"  模型: {model_name}  |  样本数: {len(all_pairs)}")
+        print(f"  {'='*56}")
         print(f"  {'指标':<10} {'均值':<12} {'标准差':<12} {'最优':<12} {'最差':<12}")
-        print(f"  {'-'*50}")
-
         for metric_name in ['MAE', 'MSE', 'PSNR', 'SSIM']:
-            vals = np.array(all_metrics[metric_name])
-            print(f"  {metric_name:<10} {vals.mean():<12.4f} {vals.std():<12.4f} "
-                  f"{vals.min():<12.4f} {vals.max():<12.4f}")
+            s = summary[metric_name]
+            print(f"  {metric_name:<10} {s['mean']:<12.4f} {s['std']:<12.4f} "
+                  f"{s['min']:<12.4f} {s['max']:<12.4f}")
 
-        print(f"{'='*60}")
-
-        # 保存指标到文件
-        report_path = os.path.join(OUTPUT_DIR, "evaluate_report.txt")
+        # 保存独立报告
+        report_path = os.path.join(output_dir, f"evaluate_report_{model_label}_{TIMESTAMP}.txt")
         with open(report_path, 'w') as f:
-            f.write(f"模型: {MODEL_FILE}\n")
+            f.write(f"模型: {model_name}\n")
+            f.write(f"时间: {TIMESTAMP}\n")
             f.write(f"测试样本数: {len(all_pairs)}\n")
             f.write(f"{'='*50}\n")
             f.write(f"{'指标':<10} {'均值':<12} {'标准差':<12} {'最优':<12} {'最差':<12}\n")
             for metric_name in ['MAE', 'MSE', 'PSNR', 'SSIM']:
-                vals = np.array(all_metrics[metric_name])
-                f.write(f"{metric_name:<10} {vals.mean():<12.4f} {vals.std():<12.4f} "
-                        f"{vals.min():<12.4f} {vals.max():<12.4f}\n")
+                s = summary[metric_name]
+                f.write(f"{metric_name:<10} {s['mean']:<12.4f} {s['std']:<12.4f} "
+                        f"{s['min']:<12.4f} {s['max']:<12.4f}\n")
             f.write(f"\n每样本 MAE 分布:\n")
-            for i, mae in enumerate(all_metrics['MAE']):
-                f.write(f"  样本 {i:4d}: MAE={mae:.2f}\n")
-        print(f"[报告] 已保存: {report_path}")
+            for i, v in enumerate(all_metrics['MAE']):
+                f.write(f"  样本 {i:4d}: MAE={v:.2f}\n")
+        print(f"  [报告] -> {os.path.basename(report_path)}")
 
-    # ---- 4e. 生成批量预测图 (所有测试样本的预测结果) ----
-    print(f"\n[批量] 生成所有测试样本的预测缩略图...")
-    thumb_size = 128
+    # ---- 批量预测图 ----
+    print(f"  [批量] 生成预测缩略图...")
     pred_imgs = []
-    for gf, sf, stf, _ in tqdm(all_pairs[:64], desc="批量预测"):  # 最多64张
-        geom_pil   = Image.open(gf).convert('RGB')
-        sener_pil  = Image.open(sf).convert('RGB')
-
-        geom_t   = preprocess_image(geom_pil).unsqueeze(0).to(DEVICE)
-        sener_t  = preprocess_image(sener_pil).unsqueeze(0).to(DEVICE)
-
+    for gf, sf, stf, _ in tqdm(all_pairs[:64], desc=f"  {model_label}", leave=False):
+        geom_pil  = Image.open(gf).convert('RGB')
+        sener_pil = Image.open(sf).convert('RGB')
+        geom_t  = preprocess_image(geom_pil).unsqueeze(0).to(DEVICE)
+        sener_t = preprocess_image(sener_pil).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             pred_t = gen(geom_t, sener_t).cpu()
-
-        pred_np = ((pred_t.squeeze(0) + 1) / 2).clip(0, 1)  # 保持在 [0,1] for vutils
+        pred_np = ((pred_t.squeeze(0) + 1) / 2).clip(0, 1)
         pred_imgs.append(pred_np)
 
     if pred_imgs:
         grid = vutils.make_grid(pred_imgs[:64], nrow=8, padding=2, normalize=False)
-        grid_path = os.path.join(OUTPUT_DIR, "evaluate_grid.png")
+        grid_path = os.path.join(output_dir, f"evaluate_grid_{model_label}_{TIMESTAMP}.png")
         vutils.save_image(grid, grid_path)
-        print(f"[批量] 预测网格已保存: {grid_path}")
+        print(f"  [批量] -> {os.path.basename(grid_path)}")
+
+    print()
+    return {'label': model_name, 'summary': summary}
+
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("  裂纹预测模型评估")
+    print(f"  设备: {DEVICE}  |  时间: {TIMESTAMP}")
+    print(f"  模型: {MODEL_FILES}")
+    print("=" * 60)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # ---- 收集数据（所有模型共用） ----
+    all_pairs = collect_test_pairs()
+    print(f"\n[数据] 找到 {len(all_pairs)} 组测试数据")
+
+    np.random.seed(42)
+    idx_vis = np.random.choice(len(all_pairs), min(NUM_SAMPLES, len(all_pairs)), replace=False)
+    vis_samples = [all_pairs[i] for i in idx_vis]
+
+    # ---- 依次评估每个模型 ----
+    all_results = []
+    for model_file in MODEL_FILES:
+        print(f"\n{'='*60}")
+        print(f"  评估: {model_file}")
+        print(f"{'='*60}")
+        result = evaluate_one_model(model_file, all_pairs, vis_samples, OUTPUT_DIR)
+        if result is not None:
+            all_results.append(result)
+
+    # ---- 模型对比汇总 ----
+    if len(all_results) >= 2 and FULL_TEST:
+        print(f"\n{'='*60}")
+        print(f"  模型对比汇总")
+        print(f"{'='*60}")
+
+        for metric_name in ['MAE', 'MSE', 'PSNR', 'SSIM']:
+            print(f"\n  [{metric_name}]")
+            print(f"  {'模型':<30} {'均值':<12} {'标准差':<12}")
+            print(f"  {'-'*50}")
+            best_model, best_val = None, float('inf') if metric_name != 'PSNR' and metric_name != 'SSIM' else float('-inf')
+            for r in all_results:
+                if r['summary'] is None:
+                    continue
+                s = r['summary'][metric_name]
+                print(f"  {r['label']:<30} {s['mean']:<12.4f} {s['std']:<12.4f}")
+                val = s['mean']
+                if metric_name in ('PSNR', 'SSIM'):
+                    if val > best_val:
+                        best_val, best_model = val, r['label']
+                else:
+                    if val < best_val:
+                        best_val, best_model = val, r['label']
+            if best_model:
+                print(f"  {'─'*50}")
+                print(f"  较优: {best_model} ({'越低越好' if metric_name not in ('PSNR','SSIM') else '越高越好'})")
+
+        # 保存对比报告
+        cmp_path = os.path.join(OUTPUT_DIR, f"evaluate_compare_{TIMESTAMP}.txt")
+        with open(cmp_path, 'w') as f:
+            f.write(f"模型对比报告  |  时间: {TIMESTAMP}\n")
+            f.write(f"测试样本数: {len(all_pairs)}\n")
+            f.write(f"对比模型: {[r['label'] for r in all_results]}\n")
+            f.write(f"{'='*60}\n")
+            for metric_name in ['MAE', 'MSE', 'PSNR', 'SSIM']:
+                f.write(f"\n[{metric_name}]\n")
+                f.write(f"{'模型':<30} {'均值':<14} {'标准差':<14}\n")
+                for r in all_results:
+                    if r['summary'] is None:
+                        continue
+                    s = r['summary'][metric_name]
+                    f.write(f"{r['label']:<30} {s['mean']:<14.4f} {s['std']:<14.4f}\n")
+        print(f"\n[对比报告] -> evaluate_compare_{TIMESTAMP}.txt")
 
     print(f"\n{'='*60}")
-    print(f"  评估完成！")
-    print(f"  对比图: {OUTPUT_DIR}\\evaluate_comparison.png")
-    print(f"  网格图: {OUTPUT_DIR}\\evaluate_grid.png")
-    print(f"  报告:   {OUTPUT_DIR}\\evaluate_report.txt")
+    print(f"  全部评估完成！输出文件:")
+    for fname in sorted(os.listdir(OUTPUT_DIR)):
+        if TIMESTAMP in fname:
+            print(f"    {fname}")
     print(f"{'='*60}")
