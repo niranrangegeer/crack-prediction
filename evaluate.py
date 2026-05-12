@@ -39,7 +39,7 @@ IMG_SIZE = 256
 # 上下文管理器：GPU 用 AMP 加速推理，CPU 直接跳过
 from contextlib import nullcontext
 def autocast_ctx():
-    return torch.cuda.amp.autocast() if USE_AMP else nullcontext()
+    return torch.amp.autocast('cuda') if USE_AMP else nullcontext()
 
 # 要评估的模型文件（二选一）
 MODEL_FILE = "generator_best.pth"   # 训练中最佳
@@ -256,8 +256,8 @@ if __name__ == '__main__':
         geom_np   = ((geom_t.cpu().squeeze(0).permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
         sener_np  = ((sener_t.cpu().squeeze(0).permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
 
-        # 误差图 (放大10倍方便观察)
-        error_map = np.abs(pred_np.astype(np.float32) - real_np.astype(np.float32))
+        # 误差图 (取三通道均值, 放大10倍方便观察)
+        error_map = np.abs(pred_np.astype(np.float32) - real_np.astype(np.float32)).mean(axis=2)
         error_map_10x = (error_map * 10).clip(0, 255).astype(np.uint8)
 
         # 差异叠加图: R通道=误差, G/B=预测
