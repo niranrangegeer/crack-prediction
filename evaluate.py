@@ -13,6 +13,13 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from tqdm import tqdm
+
+# scipy 用于 SSIM（可选，没有则跳过 SSIM）
+try:
+    from scipy.ndimage import uniform_filter
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -23,10 +30,16 @@ import torchvision.utils as vutils
 # ============================================================
 SAVE_DIR   = r"C:\Users\PS\Desktop\crack_prediction\机器学习+裂纹预测\code for my project\SaveModel"
 OUTPUT_DIR = r"C:\Users\PS\Desktop\crack_prediction\机器学习+裂纹预测\code for my project\outputs"
-DATA_ROOT  = r"E:\ntop\Abaqus_Plots"
+DATA_ROOT  = r"E:\ntop\Abaqus_Plots_v2"
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+USE_AMP = torch.cuda.is_available()  # CPU 不能用 autocast
 IMG_SIZE = 256
+
+# 上下文管理器：GPU 用 AMP 加速推理，CPU 直接跳过
+from contextlib import nullcontext
+def autocast_ctx():
+    return torch.cuda.amp.autocast() if USE_AMP else nullcontext()
 
 # 要评估的模型文件（二选一）
 MODEL_FILE = "generator_best.pth"   # 训练中最佳
@@ -151,18 +164,19 @@ def compute_metrics(pred, target):
     else:
         psnr = float('inf')
 
-    # SSIM (简化版: 逐通道平均)
-    from scipy.ndimage import uniform_filter
+    # SSIM（需要 scipy，没有则跳过）
     ssim_val = compute_ssim(p, t)
 
     return {'MAE': mae, 'MSE': mse, 'PSNR': psnr, 'SSIM': ssim_val}
 
 def compute_ssim(img1, img2, K1=0.01, K2=0.03, win_size=11):
-    """多通道 SSIM"""
-    C1 = (K1 * 255) ** 2
-    C2 = (K2 * 255) ** 2
+    """多通道 SSIM（需要 scipy）"""
+    if not HAS_SCIPY:
+        return float('nan')
 
     from scipy.ndimage import uniform_filter
+    C1 = (K1 * 255) ** 2
+    C2 = (K2 * 255) ** 2
     mu1 = uniform_filter(img1, win_size, axes=(0, 1))
     mu2 = uniform_filter(img2, win_size, axes=(0, 1))
     mu1_sq = mu1 ** 2; mu2_sq = mu2 ** 2
@@ -233,7 +247,7 @@ if __name__ == '__main__':
 
         # 推理
         with torch.no_grad():
-            with torch.cuda.amp.autocast():
+            with autocast_ctx():
                 pred_t = gen(geom_t, sener_t).cpu()
 
         # 反归一化
@@ -290,7 +304,7 @@ if __name__ == '__main__':
             status_t = preprocess_image(status_pil).unsqueeze(0)
 
             with torch.no_grad():
-                with torch.cuda.amp.autocast():
+                with autocast_ctx():
                     pred_t = gen(geom_t, sener_t).cpu()
 
             pred_np = ((pred_t.squeeze(0).permute(1,2,0).numpy() + 1) * 127.5).clip(0,255).astype(np.uint8)
