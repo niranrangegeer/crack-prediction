@@ -33,7 +33,7 @@ if torch.cuda.is_available():
 # ============================================================
 # 1. 路径配置
 # ============================================================
-DATA_ROOT  = r"E:\ntop\Abaqus_Plots"
+DATA_ROOT  = r"E:\ntop\Abaqus_Plots_v2"
 OUTPUT_DIR = r"C:\Users\PS\Desktop\crack_prediction\机器学习+裂纹预测\code for my project\outputs"
 SAVE_DIR   = r"C:\Users\PS\Desktop\crack_prediction\机器学习+裂纹预测\code for my project\SaveModel"
 LOSS_FILE  = r"C:\Users\PS\Desktop\crack_prediction\机器学习+裂纹预测\code for my project\Loss.txt"
