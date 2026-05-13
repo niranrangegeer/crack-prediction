@@ -341,7 +341,7 @@ if __name__ == '__main__':
     CHECKPOINT_FILE = os.path.join(SAVE_DIR, "checkpoint_interrupted.pth") 
     
     START_EPOCH = 0
-    TOTAL_EPOCHS = 800
+    TOTAL_EPOCHS = 2400
     best_loss = float('inf')
     loss_history = []
 

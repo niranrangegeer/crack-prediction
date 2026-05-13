@@ -41,7 +41,7 @@ def autocast_ctx():
     return torch.amp.autocast('cuda') if USE_AMP else nullcontext()
 
 # 要评估的模型（默认两个都跑）
-MODEL_FILES = ["generator_best.pth", "generator_final.pth"]
+MODEL_FILES = ["checkpoint_final.pth", "checkpoint_best.pth"]
 
 # 评估样本数
 NUM_SAMPLES = 12
@@ -207,11 +207,21 @@ def evaluate_one_model(model_name, all_pairs, vis_samples, output_dir):
         print(f"  [跳过] 模型文件不存在: {model_path}\n")
         return None
 
-    # 加载模型
+    # 加载权重（兼容两种格式：纯 generator state_dict / checkpoint 包）
+    checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=True)
+    if 'gen_state_dict' in checkpoint:
+        state_dict = checkpoint['gen_state_dict']   # checkpoint 格式
+        epoch_info = checkpoint.get('epoch', '?')
+        best_info  = checkpoint.get('best_loss', '?')
+    else:
+        state_dict = checkpoint                      # 纯 generator 权重
+        epoch_info = '?'
+        best_info  = '?'
+
     gen = Generator().to(DEVICE)
-    gen.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
+    gen.load_state_dict(state_dict)
     gen.eval()
-    print(f"  [模型] 已加载 {model_name}\n")
+    print(f"  [模型] 已加载 {model_name}  (epoch={epoch_info}, best_loss={best_info})")
 
     # ---- 对比图 ----
     print(f"  [可视化] 生成 {len(vis_samples)} 组对比图...")
