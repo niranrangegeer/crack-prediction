@@ -144,8 +144,44 @@ def collect_test_pairs():
     return all_pairs
 
 # ============================================================
-# 3. 图像质量指标
+# 3. 图像质量指标（像素级 + 裂纹级）
 # ============================================================
+def crack_mask(img, crack_thresh=128):
+    """
+    提取裂纹二值掩膜。
+    裂纹像素: 灰度值 < crack_thresh（在 uint8 [0,255] 空间中，归一化后 < 0 对应原值 < 128）
+    返回: bool array (H, W)
+    """
+    gray = img.astype(np.float32).mean(axis=2)  # RGB → 灰度
+    return gray < crack_thresh
+
+def compute_crack_metrics(pred, target, crack_thresh=128):
+    """
+    裂纹特定指标（衡量"裂纹有没有被预测到"）
+    - Coverage (Recall):  真实裂纹中，被预测覆盖的比例 → 越高越好，1.0=全部覆盖
+    - Precision:          预测裂纹中，真正是裂纹的比例 → 越高越好，1.0=没有误报
+    - F1:                 Coverage 和 Precision 的调和平均
+    - Over-predict Ratio: 预测裂纹面积 / 真实裂纹面积 → >1 画得比真实宽，<1 画得窄
+    """
+    pred_crack = crack_mask(pred, crack_thresh)
+    gt_crack   = crack_mask(target, crack_thresh)
+
+    gt_count    = gt_crack.sum()
+    pred_count  = pred_crack.sum()
+    overlap     = (pred_crack & gt_crack).sum()
+
+    coverage  = overlap / max(gt_count, 1)         # Recall
+    precision = overlap / max(pred_count, 1)        # Precision
+    f1        = 2 * coverage * precision / max(coverage + precision, 1e-8)
+    overpred  = pred_count / max(gt_count, 1)       # >1 画得比真值宽
+
+    return {
+        'CrackCoverage':  coverage,
+        'CrackPrecision': precision,
+        'CrackF1':        f1,
+        'CrackOverPred':  overpred,
+    }
+
 def compute_metrics(pred, target):
     """
     pred, target: uint8 numpy arrays (H, W, 3)
@@ -169,7 +205,12 @@ def compute_metrics(pred, target):
     # SSIM（需要 scipy，没有则跳过）
     ssim_val = compute_ssim(p, t)
 
-    return {'MAE': mae, 'MSE': mse, 'PSNR': psnr, 'SSIM': ssim_val}
+    # 裂纹特定指标
+    crack_m = compute_crack_metrics(pred, target)
+
+    result = {'MAE': mae, 'MSE': mse, 'PSNR': psnr, 'SSIM': ssim_val}
+    result.update(crack_m)
+    return result
 
 def compute_ssim(img1, img2, K1=0.01, K2=0.03, win_size=11):
     """多通道 SSIM（需要 scipy）"""
@@ -265,9 +306,12 @@ def evaluate_one_model(model_name, all_pairs, vis_samples, output_dir):
             axes[row, col].set_title(title, fontsize=8)
             axes[row, col].axis('off')
 
+        # 计算像素误差和裂纹覆盖率
         mae_sample = np.abs(pred_np.astype(np.float32) - real_np.astype(np.float32)).mean()
-        axes[row, 0].set_ylabel(f'{pname}\nMAE={mae_sample:.1f}',
-                                fontsize=7, rotation=0, labelpad=40)
+        crack_m    = compute_crack_metrics(pred_np, real_np)
+        axes[row, 0].set_ylabel(
+            f'{pname}\nMAE={mae_sample:.1f}  Cov={crack_m["CrackCoverage"]:.2f}',
+            fontsize=6.5, rotation=0, labelpad=40)
 
     plt.suptitle(f'模型: {model_name}  |  时间: {TIMESTAMP}', fontsize=10, y=1.01)
     plt.tight_layout(pad=0.5)
@@ -280,7 +324,8 @@ def evaluate_one_model(model_name, all_pairs, vis_samples, output_dir):
     summary = None
     if FULL_TEST:
         print(f"  [评估] 全量测试集 ({len(all_pairs)} 张)...")
-        all_metrics = {'MAE': [], 'MSE': [], 'PSNR': [], 'SSIM': []}
+        all_metrics = {'MAE': [], 'MSE': [], 'PSNR': [], 'SSIM': [],
+                       'CrackCoverage': [], 'CrackPrecision': [], 'CrackF1': [], 'CrackOverPred': []}
 
         for gf, sf, stf, _ in tqdm(all_pairs, desc=f"  {model_label}", leave=False):
             geom_pil   = Image.open(gf).convert('RGB')
@@ -308,14 +353,31 @@ def evaluate_one_model(model_name, all_pairs, vis_samples, output_dir):
         } for k, v in all_metrics.items()}
 
         # 打印（带模型标签）
-        print(f"\n  {'='*56}")
+        print(f"\n  {'='*60}")
         print(f"  模型: {model_name}  |  样本数: {len(all_pairs)}")
-        print(f"  {'='*56}")
-        print(f"  {'指标':<10} {'均值':<12} {'标准差':<12} {'最优':<12} {'最差':<12}")
-        for metric_name in ['MAE', 'MSE', 'PSNR', 'SSIM']:
+        print(f"  {'='*60}")
+
+        # 像素级指标
+        pixel_metrics = ['MAE', 'MSE', 'PSNR', 'SSIM']
+        crack_metrics = ['CrackCoverage', 'CrackPrecision', 'CrackF1', 'CrackOverPred']
+
+        print(f"\n  [像素级指标] (越低越好，PSNR/SSIM 除外)")
+        print(f"  {'指标':<18} {'均值':<10} {'标准差':<10} {'最优':<10} {'最差':<10}")
+        print(f"  {'-'*55}")
+        for metric_name in pixel_metrics:
+            if metric_name not in summary: continue
             s = summary[metric_name]
-            print(f"  {metric_name:<10} {s['mean']:<12.4f} {s['std']:<12.4f} "
-                  f"{s['min']:<12.4f} {s['max']:<12.4f}")
+            print(f"  {metric_name:<18} {s['mean']:<10.4f} {s['std']:<10.4f} "
+                  f"{s['min']:<10.4f} {s['max']:<10.4f}")
+
+        print(f"\n  [裂纹级指标] (Coverage/Precision/F1 越高越好, OverPred >1 = 画得比真值宽)")
+        print(f"  {'指标':<18} {'均值':<10} {'标准差':<10} {'最优':<10} {'最差':<10}")
+        print(f"  {'-'*55}")
+        for metric_name in crack_metrics:
+            if metric_name not in summary: continue
+            s = summary[metric_name]
+            print(f"  {metric_name:<18} {s['mean']:<10.4f} {s['std']:<10.4f} "
+                  f"{s['min']:<10.4f} {s['max']:<10.4f}")
 
         # 保存独立报告
         report_path = os.path.join(output_dir, f"evaluate_report_{model_label}_{TIMESTAMP}.txt")
@@ -323,12 +385,21 @@ def evaluate_one_model(model_name, all_pairs, vis_samples, output_dir):
             f.write(f"模型: {model_name}\n")
             f.write(f"时间: {TIMESTAMP}\n")
             f.write(f"测试样本数: {len(all_pairs)}\n")
-            f.write(f"{'='*50}\n")
-            f.write(f"{'指标':<10} {'均值':<12} {'标准差':<12} {'最优':<12} {'最差':<12}\n")
-            for metric_name in ['MAE', 'MSE', 'PSNR', 'SSIM']:
+            f.write(f"{'='*60}\n")
+            f.write(f"\n[像素级指标]\n")
+            f.write(f"{'指标':<18} {'均值':<14} {'标准差':<14} {'最优':<14} {'最差':<14}\n")
+            for metric_name in pixel_metrics:
+                if metric_name not in summary: continue
                 s = summary[metric_name]
-                f.write(f"{metric_name:<10} {s['mean']:<12.4f} {s['std']:<12.4f} "
-                        f"{s['min']:<12.4f} {s['max']:<12.4f}\n")
+                f.write(f"{metric_name:<18} {s['mean']:<14.4f} {s['std']:<14.4f} "
+                        f"{s['min']:<14.4f} {s['max']:<14.4f}\n")
+            f.write(f"\n[裂纹级指标]\n")
+            f.write(f"{'指标':<18} {'均值':<14} {'标准差':<14} {'最优':<14} {'最差':<14}\n")
+            for metric_name in crack_metrics:
+                if metric_name not in summary: continue
+                s = summary[metric_name]
+                f.write(f"{metric_name:<18} {s['mean']:<14.4f} {s['std']:<14.4f} "
+                        f"{s['min']:<14.4f} {s['max']:<14.4f}\n")
             f.write(f"\n每样本 MAE 分布:\n")
             for i, v in enumerate(all_metrics['MAE']):
                 f.write(f"  样本 {i:4d}: MAE={v:.2f}\n")
@@ -390,26 +461,35 @@ if __name__ == '__main__':
         print(f"  模型对比汇总")
         print(f"{'='*60}")
 
-        for metric_name in ['MAE', 'MSE', 'PSNR', 'SSIM']:
+        all_metric_names = ['MAE', 'MSE', 'PSNR', 'SSIM',
+                           'CrackCoverage', 'CrackPrecision', 'CrackF1', 'CrackOverPred']
+
+        for metric_name in all_metric_names:
+            # 跳过不存在的指标
+            if all(r['summary'] is None or metric_name not in r['summary'] for r in all_results):
+                continue
+
+            lower_better = metric_name in ('MAE', 'MSE', 'CrackOverPred')
             print(f"\n  [{metric_name}]")
             print(f"  {'模型':<30} {'均值':<12} {'标准差':<12}")
             print(f"  {'-'*50}")
-            best_model, best_val = None, float('inf') if metric_name != 'PSNR' and metric_name != 'SSIM' else float('-inf')
+            best_model, best_val = None, float('inf') if lower_better else float('-inf')
             for r in all_results:
-                if r['summary'] is None:
+                if r['summary'] is None or metric_name not in r['summary']:
                     continue
                 s = r['summary'][metric_name]
                 print(f"  {r['label']:<30} {s['mean']:<12.4f} {s['std']:<12.4f}")
                 val = s['mean']
-                if metric_name in ('PSNR', 'SSIM'):
-                    if val > best_val:
-                        best_val, best_model = val, r['label']
-                else:
+                if lower_better:
                     if val < best_val:
                         best_val, best_model = val, r['label']
+                else:
+                    if val > best_val:
+                        best_val, best_model = val, r['label']
             if best_model:
+                direction = '越低越好' if lower_better else '越高越好'
                 print(f"  {'─'*50}")
-                print(f"  较优: {best_model} ({'越低越好' if metric_name not in ('PSNR','SSIM') else '越高越好'})")
+                print(f"  较优: {best_model} ({direction})")
 
         # 保存对比报告
         cmp_path = os.path.join(OUTPUT_DIR, f"evaluate_compare_{TIMESTAMP}.txt")
@@ -418,11 +498,13 @@ if __name__ == '__main__':
             f.write(f"测试样本数: {len(all_pairs)}\n")
             f.write(f"对比模型: {[r['label'] for r in all_results]}\n")
             f.write(f"{'='*60}\n")
-            for metric_name in ['MAE', 'MSE', 'PSNR', 'SSIM']:
+            for metric_name in all_metric_names:
+                if all(r['summary'] is None or metric_name not in r['summary'] for r in all_results):
+                    continue
                 f.write(f"\n[{metric_name}]\n")
                 f.write(f"{'模型':<30} {'均值':<14} {'标准差':<14}\n")
                 for r in all_results:
-                    if r['summary'] is None:
+                    if r['summary'] is None or metric_name not in r['summary']:
                         continue
                     s = r['summary'][metric_name]
                     f.write(f"{r['label']:<30} {s['mean']:<14.4f} {s['std']:<14.4f}\n")
