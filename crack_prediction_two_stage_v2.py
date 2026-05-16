@@ -9,7 +9,7 @@
 #   - 裂纹加粗核 3→2 (GT裂纹更细)
 #   - 每30epoch输出样本图
 #   - 每次运行新建输出子文件夹
-#   - Batch=24 Workers=6 (提速)
+#   - Batch=32 Workers=8 (3090 24G优化)
 # ============================================================
 
 import os, sys, glob, signal
@@ -446,8 +446,9 @@ if __name__ == '__main__':
     test_pairs  = [all_triplets[i] for i in idx[split:]]
     print(f"[数据] 训练: {len(train_pairs)}  测试: {len(test_pairs)}")
 
-    BATCH_SIZE = 24
-    NUM_WORKERS = 6
+    # 3090 24G 配置：Batch 拉满，Workers 拉满
+    BATCH_SIZE = 32
+    NUM_WORKERS = 8
 
     train_dataset = CrackDataset(train_pairs, is_train=True)
     test_dataset  = CrackDataset(test_pairs,  is_train=False)
