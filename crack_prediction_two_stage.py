@@ -15,6 +15,9 @@
 # ============================================================
 
 import os, sys, glob, signal
+import warnings
+warnings.filterwarnings('ignore')  # 抑制 Triton 警告 (Windows 不支持)
+os.environ['TORCHDYNAMO_VERBOSE'] = '0'
 import numpy as np
 import torch
 import torch.nn as nn
