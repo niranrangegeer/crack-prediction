@@ -8,16 +8,11 @@
 #   --mode stage1  : 仅训练 Stage1 (Geom→Sener)
 #   --mode stage2  : 仅训练 Stage2 (Geom+Sener→Crack)
 #   --mode joint   : 端到端联合训练 (默认)
-#   --mode separate: 分别独立训练 Stage1 再 Stage2
 #
-# 推理:
-#   训练完成后，只需 Geom 图像 → Stage1 → Sener_pred → Stage2 → Crack_pred
+# 推理: 只需 Geom → Stage1 → Sener_pred → Stage2 → Crack_pred
 # ============================================================
 
 import os, sys, glob, signal
-import warnings
-warnings.filterwarnings('ignore')  # 抑制 Triton 警告 (Windows 不支持)
-os.environ['TORCHDYNAMO_VERBOSE'] = '0'
 import numpy as np
 import torch
 import torch.nn as nn
@@ -33,7 +28,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torchvision.utils as vutils
-from datetime import datetime
 
 # ============================================================
 # 0. 设备 & 路径
@@ -167,10 +161,6 @@ class DeconvBlock(nn.Module):
     def forward(self, x): return self.block(x)
 
 class UNetGenerator(nn.Module):
-    """
-    通用 U-Net Generator (pix2pix 风格)
-    in_ch: 输入通道数, out_ch: 输出通道数
-    """
     def __init__(self, in_ch, out_ch, base_ch=64):
         super().__init__()
         self.e1 = nn.Sequential(nn.Conv2d(in_ch, base_ch, 4, 2, 1), nn.LeakyReLU(0.2, inplace=True))
@@ -201,7 +191,6 @@ class UNetGenerator(nn.Module):
         return self.out_conv(torch.cat([d7, e1], dim=1))
 
 class PatchGANDiscriminator(nn.Module):
-    """PatchGAN 判别器, in_ch: 输入通道数 (条件图 + 目标图)"""
     def __init__(self, in_ch, base_ch=64):
         super().__init__()
         self.net = nn.Sequential(
@@ -214,33 +203,26 @@ class PatchGANDiscriminator(nn.Module):
         return self.net(torch.cat([cond, target], dim=1))
 
 # ============================================================
-# 5. 保存 / 加载
+# 5. 断点续训 (只存模型和优化器，scaler 不存避免兼容问题)
 # ============================================================
-def save_checkpoint_two_stage(stage1, stage2, disc1, disc2, opt_s1, opt_s2, opt_d1, opt_d2,
-                               epoch, loss_history, best_loss, scalers, path):
-    ckpt = {'epoch': epoch, 'loss_history': loss_history, 'best_loss': best_loss,
-            'stage1': stage1.state_dict(), 'stage2': stage2.state_dict(),
-            'disc1': disc1.state_dict(), 'disc2': disc2.state_dict(),
-            'opt_s1': opt_s1.state_dict(), 'opt_s2': opt_s2.state_dict(),
-            'opt_d1': opt_d1.state_dict(), 'opt_d2': opt_d2.state_dict()}
-    for i, key in enumerate(['scaler_s1', 'scaler_s2', 'scaler_d1', 'scaler_d2']):
-        if scalers[i] is not None:
-            ckpt[key] = scalers[i].state_dict()
+def save_checkpoint_two_stage(stage1, stage2, disc1, disc2, opt_g, opt_d,
+                               epoch, loss_history, best_loss, path):
+    ckpt = {
+        'epoch': epoch, 'loss_history': loss_history, 'best_loss': best_loss,
+        'stage1': stage1.state_dict(), 'stage2': stage2.state_dict(),
+        'disc1': disc1.state_dict(), 'disc2': disc2.state_dict(),
+        'opt_g': opt_g.state_dict(), 'opt_d': opt_d.state_dict(),
+    }
     torch.save(ckpt, path)
     print(f"[断点] 已保存至: {path}  (epoch {epoch + 1})")
 
-def load_checkpoint_two_stage(stage1, stage2, disc1, disc2, opt_s1, opt_s2, opt_d1, opt_d2,
-                               scalers, path):
+def load_checkpoint_two_stage(stage1, stage2, disc1, disc2, opt_g, opt_d, path):
     if not os.path.exists(path):
         return 0, [], float('inf')
     ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
     stage1.load_state_dict(ckpt['stage1']); stage2.load_state_dict(ckpt['stage2'])
     disc1.load_state_dict(ckpt['disc1']); disc2.load_state_dict(ckpt['disc2'])
-    opt_s1.load_state_dict(ckpt['opt_s1']); opt_s2.load_state_dict(ckpt['opt_s2'])
-    opt_d1.load_state_dict(ckpt['opt_d1']); opt_d2.load_state_dict(ckpt['opt_d2'])
-    for i, key in enumerate(['scaler_s1', 'scaler_s2', 'scaler_d1', 'scaler_d2']):
-        if scalers[i] is not None and key in ckpt:
-            scalers[i].load_state_dict(ckpt[key])
+    opt_g.load_state_dict(ckpt['opt_g']); opt_d.load_state_dict(ckpt['opt_d'])
     start_epoch = ckpt['epoch'] + 1
     loss_history = ckpt.get('loss_history', [])
     best_loss = ckpt.get('best_loss', float('inf'))
@@ -248,9 +230,9 @@ def load_checkpoint_two_stage(stage1, stage2, disc1, disc2, opt_s1, opt_s2, opt_
     return start_epoch, loss_history, best_loss
 
 # ============================================================
-# 6. 训练函数
+# 6. 训练函数 (所有模式共用 2 个 scaler: scaler_g + scaler_d)
 # ============================================================
-def train_stage1(stage1, disc1, train_loader, opt_s1, opt_d1, scaler_s1, scaler_d1,
+def train_stage1(stage1, disc1, train_loader, opt_g, opt_d, scaler_g, scaler_d,
                   criterion_gan, criterion_l1):
     """训练 Stage1: Geom → Sener"""
     stage1.train(); disc1.train()
@@ -259,43 +241,35 @@ def train_stage1(stage1, disc1, train_loader, opt_s1, opt_d1, scaler_s1, scaler_
     for geom_t, sener_t, _ in train_loader:
         geom_t = geom_t.to(DEVICE); sener_t = sener_t.to(DEVICE)
 
-        # Train Disc1 (条件: Geom, 目标: Sener)
-        opt_d1.zero_grad()
+        opt_d.zero_grad()
         with autocast():
             fake_sener = stage1(geom_t)
             d_real = disc1(geom_t, sener_t)
             d_fake = disc1(geom_t, fake_sener.detach())
             d_loss = (criterion_gan(d_real, torch.ones_like(d_real)) +
                       criterion_gan(d_fake, torch.zeros_like(d_fake))) * 0.5
-        scaler_d1.scale(d_loss).backward()
-        scaler_d1.step(opt_d1); scaler_d1.update()
+        scaler_d.scale(d_loss).backward()
+        scaler_d.step(opt_d); scaler_d.update()
 
-        # Train Stage1
-        opt_s1.zero_grad()
+        opt_g.zero_grad()
         with autocast():
             fake_sener = stage1(geom_t)
             d_fake = disc1(geom_t, fake_sener)
             g_loss = criterion_gan(d_fake, torch.ones_like(d_fake)) + \
                      criterion_l1(fake_sener, sener_t) * 100.0
-        scaler_s1.scale(g_loss).backward()
-        scaler_s1.step(opt_s1); scaler_s1.update()
+        scaler_g.scale(g_loss).backward()
+        scaler_g.step(opt_g); scaler_g.update()
 
         epoch_g_loss += g_loss.item(); epoch_d_loss += d_loss.item(); n += 1
 
     return epoch_g_loss / max(n, 1), epoch_d_loss / max(n, 1)
 
 
-def train_stage2(stage1, stage2, disc2, train_loader, opt_s2, opt_d2, scaler_s2, scaler_d2,
+def train_stage2(stage1, stage2, disc2, train_loader, opt_g, opt_d, scaler_g, scaler_d,
                   criterion_gan, criterion_l1, use_pred_sener=False):
-    """
-    训练 Stage2: Geom + Sener → Crack
-    use_pred_sener=True: 用 Stage1 预测的 Sener (端到端)
-    use_pred_sener=False: 用真实 Sener (独立训练 Stage2)
-    """
+    """训练 Stage2: Geom + Sener → Crack"""
     if use_pred_sener:
-        stage1.eval()  # 冻结 Stage1
-    else:
-        stage1.train()  # 不参与
+        stage1.eval()
     stage2.train(); disc2.train()
     epoch_g_loss = 0.0; epoch_d_loss = 0.0; n = 0
 
@@ -303,38 +277,34 @@ def train_stage2(stage1, stage2, disc2, train_loader, opt_s2, opt_d2, scaler_s2,
         geom_t = geom_t.to(DEVICE); sener_t = sener_t.to(DEVICE)
         status_t = status_t.to(DEVICE)
 
-        # 决定用真实 Sener 还是预测 Sener
         if use_pred_sener:
             with torch.no_grad():
                 sener_input = stage1(geom_t)
         else:
             sener_input = sener_t
 
-        # Train Disc2 (条件: Geom+Sener, 目标: Status)
-        opt_d2.zero_grad()
+        opt_d.zero_grad()
         with autocast():
-            fake_status = stage2(torch.cat([geom_t, sener_input], dim=1))
-            d_real = disc2(torch.cat([geom_t, sener_input], dim=1), status_t)
-            d_fake = disc2(torch.cat([geom_t, sener_input], dim=1), fake_status.detach())
+            cond = torch.cat([geom_t, sener_input], dim=1)
+            fake_status = stage2(cond)
+            d_real = disc2(cond, status_t)
+            d_fake = disc2(cond, fake_status.detach())
             d_loss = (criterion_gan(d_real, torch.ones_like(d_real)) +
                       criterion_gan(d_fake, torch.zeros_like(d_fake))) * 0.5
-        scaler_d2.scale(d_loss).backward()
-        scaler_d2.step(opt_d2); scaler_d2.update()
+        scaler_d.scale(d_loss).backward()
+        scaler_d.step(opt_d); scaler_d.update()
 
-        # Train Stage2
-        opt_s2.zero_grad()
+        opt_g.zero_grad()
         with autocast():
-            fake_status = stage2(torch.cat([geom_t, sener_input], dim=1))
-            d_fake = disc2(torch.cat([geom_t, sener_input], dim=1), fake_status)
-
-            # 加权 L1: 裂纹区域 50x 权重
+            cond = torch.cat([geom_t, sener_input], dim=1)
+            fake_status = stage2(cond)
+            d_fake = disc2(cond, fake_status)
             weight_mask = torch.ones_like(status_t)
             weight_mask[status_t < 0.0] = 50.0
             l1_weighted = torch.mean(torch.abs(fake_status - status_t) * weight_mask) * 100.0
-
             g_loss = criterion_gan(d_fake, torch.ones_like(d_fake)) + l1_weighted
-        scaler_s2.scale(g_loss).backward()
-        scaler_s2.step(opt_s2); scaler_s2.update()
+        scaler_g.scale(g_loss).backward()
+        scaler_g.step(opt_g); scaler_g.update()
 
         epoch_g_loss += g_loss.item(); epoch_d_loss += d_loss.item(); n += 1
 
@@ -343,15 +313,11 @@ def train_stage2(stage1, stage2, disc2, train_loader, opt_s2, opt_d2, scaler_s2,
 
 def train_joint(stage1, stage2, disc1, disc2, train_loader,
                  opt_s1, opt_s2, opt_d1, opt_d2,
-                 scaler_s1, scaler_s2, scaler_d1, scaler_d2,
+                 scaler_g, scaler_d,
                  criterion_gan, criterion_l1):
-    """
-    端到端联合训练: Geom → Sener_pred → Crack_pred
-    Loss = L_sener(GAN+L1) + L_crack(GAN+加权L1)
-    """
+    """端到端联合训练: Geom → Sener_pred → Crack_pred"""
     stage1.train(); stage2.train(); disc1.train(); disc2.train()
-    epoch_g1_loss = 0.0; epoch_d1_loss = 0.0
-    epoch_g2_loss = 0.0; epoch_d2_loss = 0.0; n = 0
+    epoch_g_loss = 0.0; epoch_s_loss = 0.0; epoch_d_loss = 0.0; n = 0
 
     for geom_t, sener_t, status_t in train_loader:
         geom_t = geom_t.to(DEVICE); sener_t = sener_t.to(DEVICE)
@@ -365,8 +331,8 @@ def train_joint(stage1, stage2, disc1, disc2, train_loader,
             d1_fake = disc1(geom_t, fake_sener.detach())
             d1_loss = (criterion_gan(d1_real, torch.ones_like(d1_real)) +
                        criterion_gan(d1_fake, torch.zeros_like(d1_fake))) * 0.5
-        scaler_d1.scale(d1_loss).backward()
-        scaler_d1.step(opt_d1); scaler_d1.update()
+        scaler_d.scale(d1_loss).backward()
+        scaler_d.step(opt_d1)
 
         # ---- Train Disc2 (Crack) ----
         cond2 = torch.cat([geom_t, fake_sener.detach()], dim=1)
@@ -377,8 +343,8 @@ def train_joint(stage1, stage2, disc1, disc2, train_loader,
             d2_fake = disc2(cond2, fake_status.detach())
             d2_loss = (criterion_gan(d2_real, torch.ones_like(d2_real)) +
                        criterion_gan(d2_fake, torch.zeros_like(d2_fake))) * 0.5
-        scaler_d2.scale(d2_loss).backward()
-        scaler_d2.step(opt_d2); scaler_d2.update()
+        scaler_d.scale(d2_loss).backward()
+        scaler_d.step(opt_d2); scaler_d.update()
 
         # ---- Train Stage1 + Stage2 (Joint Generator) ----
         opt_s1.zero_grad(); opt_s2.zero_grad()
@@ -386,11 +352,10 @@ def train_joint(stage1, stage2, disc1, disc2, train_loader,
             fake_sener = stage1(geom_t)
             fake_status = stage2(torch.cat([geom_t, fake_sener], dim=1))
 
-            # Sener loss
-            g1_loss = criterion_gan(disc1(geom_t, fake_sener), torch.ones(1, device=DEVICE).expand_as(d1_real)) + \
+            g1_loss = criterion_gan(disc1(geom_t, fake_sener),
+                                    torch.ones(1, device=DEVICE).expand_as(d1_real)) + \
                       criterion_l1(fake_sener, sener_t) * 100.0
 
-            # Crack loss (加权 L1)
             weight_mask = torch.ones_like(status_t)
             weight_mask[status_t < 0.0] = 50.0
             l1_weighted = torch.mean(torch.abs(fake_status - status_t) * weight_mask) * 100.0
@@ -399,15 +364,14 @@ def train_joint(stage1, stage2, disc1, disc2, train_loader,
 
             g_total = g1_loss + g2_loss
 
-        scaler_s1.scale(g_total).backward()
-        scaler_s1.step(opt_s1); scaler_s1.step(opt_s2)
-        scaler_s1.update()
+        scaler_g.scale(g_total).backward()
+        scaler_g.step(opt_s1); scaler_g.step(opt_s2); scaler_g.update()
 
-        epoch_g1_loss += g1_loss.item(); epoch_d1_loss += d1_loss.item()
-        epoch_g2_loss += g2_loss.item(); epoch_d2_loss += d2_loss.item(); n += 1
+        epoch_g_loss += g_total.item(); epoch_s_loss += g1_loss.item()
+        epoch_d_loss += (d1_loss.item() + d2_loss.item()); n += 1
 
-    return (epoch_g1_loss / max(n, 1), epoch_d1_loss / max(n, 1),
-            epoch_g2_loss / max(n, 1), epoch_d2_loss / max(n, 1))
+    return (epoch_s_loss / max(n, 1), epoch_d_loss / max(n, 1),
+            epoch_g_loss / max(n, 1))
 
 # ============================================================
 # 7. 可视化 & 保存
@@ -419,10 +383,10 @@ def update_loss_plot(loss_history, loss_file, output_dir):
             f.write('\t'.join(f'{v:.6f}' for v in row) + '\n')
     plt.figure(figsize=(12, 5))
     n_lines = len(loss_history[0])
-    labels = ['G1(Sener)', 'D1(Sener)', 'G2(Crack)', 'D2(Crack)']
-    for i in range(n_lines):
+    labels = ['G1(Sener)', 'D(avg)', 'G(total)']
+    for i in range(min(n_lines, len(labels))):
         vals = [l[i] for l in loss_history]
-        plt.plot(vals, label=labels[i] if i < len(labels) else f'Loss{i}', alpha=0.7)
+        plt.plot(vals, label=labels[i], alpha=0.7)
     plt.xlabel('Epoch'); plt.ylabel('Loss')
     plt.title('Two-Stage Training Loss'); plt.legend(); plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -466,6 +430,7 @@ if __name__ == '__main__':
     print(f"  两步法裂纹预测 — 训练模式: {MODE}")
     print(f"  Stage 1: Geom → Sener (替代 FEM)")
     print(f"  Stage 2: Geom + Sener → Crack")
+    print(f"  推理: Geom → Stage1 → Sener_pred → Stage2 → Crack_pred")
     print("=" * 60)
 
     # ---- 数据 ----
@@ -479,8 +444,8 @@ if __name__ == '__main__':
     test_pairs  = [all_triplets[i] for i in idx[split:]]
     print(f"[数据] 训练: {len(train_pairs)}  测试: {len(test_pairs)}")
 
-    BATCH_SIZE = 32
-    NUM_WORKERS = 8
+    BATCH_SIZE = 16
+    NUM_WORKERS = 4
 
     train_dataset = CrackDataset(train_pairs, is_train=True)
     test_dataset  = CrackDataset(test_pairs,  is_train=False)
@@ -492,34 +457,27 @@ if __name__ == '__main__':
                              persistent_workers=True)
 
     # ---- 模型 ----
-    # Stage 1: Geom(3ch) → Sener(3ch)
-    stage1 = UNetGenerator(in_ch=3, out_ch=3).to(DEVICE)
-    disc1  = PatchGANDiscriminator(in_ch=6).to(DEVICE)   # 条件Geom(3)+目标Sener(3)
-
-    # Stage 2: Geom(3ch) + Sener(3ch) → Status(3ch)
-    stage2 = UNetGenerator(in_ch=6, out_ch=3).to(DEVICE)
-    disc2  = PatchGANDiscriminator(in_ch=9).to(DEVICE)   # 条件Geom+Sener(6)+目标Status(3)
-
-    # torch.compile 在 Windows 上不可用 (Triton 不支持 Windows)
-    # AMP 混合精度已经提供足够加速，去掉 compile 不影响训练速度
+    stage1 = UNetGenerator(in_ch=3, out_ch=3).to(DEVICE)       # Geom → Sener
+    disc1  = PatchGANDiscriminator(in_ch=6).to(DEVICE)          # 条件Geom(3)+Sener(3)
+    stage2 = UNetGenerator(in_ch=6, out_ch=3).to(DEVICE)       # Geom+Sener → Crack
+    disc2  = PatchGANDiscriminator(in_ch=9).to(DEVICE)          # 条件Geom+Sener(6)+Status(3)
 
     criterion_gan = nn.MSELoss()
     criterion_l1  = nn.L1Loss()
 
-    # TTUR: Stage1 和 Stage2 都用不对称学习率
-    opt_s1 = optim.Adam(stage1.parameters(), lr=2e-4, betas=(0.5, 0.999))
-    opt_d1 = optim.Adam(disc1.parameters(),  lr=5e-5, betas=(0.5, 0.999))
-    opt_s2 = optim.Adam(stage2.parameters(), lr=2e-4, betas=(0.5, 0.999))
-    opt_d2 = optim.Adam(disc2.parameters(),  lr=5e-5, betas=(0.5, 0.999))
+    # TTUR: 判别器学习率更低
+    opt_g = optim.Adam(list(stage1.parameters()) + list(stage2.parameters()),
+                       lr=2e-4, betas=(0.5, 0.999))
+    opt_d = optim.Adam(list(disc1.parameters()) + list(disc2.parameters()),
+                       lr=5e-5, betas=(0.5, 0.999))
 
-    scaler_s1 = GradScaler(); scaler_d1 = GradScaler()
-    scaler_s2 = GradScaler(); scaler_d2 = GradScaler()
+    scaler_g = GradScaler()
+    scaler_d = GradScaler()
 
     # ---- 断点续训 ----
     CKPT_PATH = os.path.join(SAVE_DIR, "checkpoint_two_stage.pth")
-    scalers = [scaler_s1, scaler_s2, scaler_d1, scaler_d2]
     start_epoch, loss_history, best_loss = load_checkpoint_two_stage(
-        stage1, stage2, disc1, disc2, opt_s1, opt_s2, opt_d1, opt_d2, scalers, CKPT_PATH)
+        stage1, stage2, disc1, disc2, opt_g, opt_d, CKPT_PATH)
 
     EPOCHS = 400
     print(f"\n[训练] 设备: {DEVICE}  |  Epochs: {EPOCHS}  |  Batch: {BATCH_SIZE}")
@@ -532,43 +490,37 @@ if __name__ == '__main__':
         for epoch in epoch_pbar:
             if MODE == 'stage1':
                 g_loss, d_loss = train_stage1(
-                    stage1, disc1, train_loader, opt_s1, opt_d1, scaler_s1, scaler_d1,
+                    stage1, disc1, train_loader, opt_g, opt_d, scaler_g, scaler_d,
                     criterion_gan, criterion_l1)
                 loss_history.append((g_loss, d_loss))
 
             elif MODE == 'stage2':
-                # Stage2 独立训练：用真实 Sener
                 g_loss, d_loss = train_stage2(
-                    stage1, stage2, disc2, train_loader, opt_s2, opt_d2,
-                    scaler_s2, scaler_d2, criterion_gan, criterion_l1,
-                    use_pred_sener=False)
+                    stage1, stage2, disc2, train_loader, opt_g, opt_d, scaler_g, scaler_d,
+                    criterion_gan, criterion_l1, use_pred_sener=False)
                 loss_history.append((g_loss, d_loss))
 
             elif MODE == 'joint':
-                g1_loss, d1_loss, g2_loss, d2_loss = train_joint(
+                s_loss, d_loss, g_loss = train_joint(
                     stage1, stage2, disc1, disc2, train_loader,
-                    opt_s1, opt_s2, opt_d1, opt_d2,
-                    scaler_s1, scaler_s2, scaler_d1, scaler_d2,
+                    opt_g, opt_g, opt_d, opt_d,
+                    scaler_g, scaler_d,
                     criterion_gan, criterion_l1)
-                loss_history.append((g1_loss, d1_loss, g2_loss, d2_loss))
-                epoch_pbar.set_postfix(G1=f'{g1_loss:.3f}', D1=f'{d1_loss:.3f}',
-                                       G2=f'{g2_loss:.3f}', D2=f'{d2_loss:.3f}')
+                loss_history.append((s_loss, d_loss, g_loss))
+                epoch_pbar.set_postfix(Sener=f'{s_loss:.2f}', D=f'{d_loss:.2f}', G=f'{g_loss:.2f}')
+
             else:
                 print(f"[错误] 未知模式: {MODE}")
                 sys.exit(1)
 
-            # 可视化
             if (epoch + 1) % 50 == 0 or epoch == start_epoch:
                 save_visual_samples(stage1, stage2, test_loader, epoch + 1, OUTPUT_DIR, DEVICE)
 
-            # Loss 曲线
             if (epoch + 1) % 10 == 0:
                 update_loss_plot(loss_history,
                     os.path.join(OUTPUT_DIR, "Loss_two_stage.txt"), OUTPUT_DIR)
 
-            # 保存最佳
-            current_best = loss_history[-1][0] if MODE == 'stage2' else \
-                           (loss_history[-1][0] + loss_history[-1][2]) / 2
+            current_best = loss_history[-1][0]
             if current_best < best_loss:
                 best_loss = current_best
                 torch.save(stage1.state_dict(), os.path.join(SAVE_DIR, "stage1_best.pth"))
@@ -576,24 +528,20 @@ if __name__ == '__main__':
 
             if _stop_requested:
                 print(f"\n[训练] epoch {epoch+1} 后停止")
-                save_checkpoint_two_stage(stage1, stage2, disc1, disc2,
-                    opt_s1, opt_s2, opt_d1, opt_d2, epoch, loss_history, best_loss,
-                    scalers, CKPT_PATH)
+                save_checkpoint_two_stage(stage1, stage2, disc1, disc2, opt_g, opt_d,
+                    epoch, loss_history, best_loss, CKPT_PATH)
                 stopped_early = True
                 break
 
     except KeyboardInterrupt:
         print(f"\n[训练] KeyboardInterrupt")
-        save_checkpoint_two_stage(stage1, stage2, disc1, disc2,
-            opt_s1, opt_s2, opt_d1, opt_d2, epoch, loss_history, best_loss,
-            scalers, CKPT_PATH)
+        save_checkpoint_two_stage(stage1, stage2, disc1, disc2, opt_g, opt_d,
+            epoch, loss_history, best_loss, CKPT_PATH)
         stopped_early = True
 
-    # ---- 保存 ----
     if not stopped_early:
-        save_checkpoint_two_stage(stage1, stage2, disc1, disc2,
-            opt_s1, opt_s2, opt_d1, opt_d2, EPOCHS - 1, loss_history, best_loss,
-            scalers, CKPT_PATH)
+        save_checkpoint_two_stage(stage1, stage2, disc1, disc2, opt_g, opt_d,
+            EPOCHS - 1, loss_history, best_loss, CKPT_PATH)
 
     torch.save(stage1.state_dict(), os.path.join(SAVE_DIR, "stage1_final.pth"))
     torch.save(stage2.state_dict(), os.path.join(SAVE_DIR, "stage2_final.pth"))
