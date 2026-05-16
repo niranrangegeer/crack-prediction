@@ -526,8 +526,8 @@ if __name__ == '__main__':
             current_best = loss_history[-1][0]
             if current_best < best_loss:
                 best_loss = current_best
-                torch.save(stage1.state_dict(), os.path.join(SAVE_DIR, "stage1_best.pth"))
-                torch.save(stage2.state_dict(), os.path.join(SAVE_DIR, "stage2_best.pth"))
+                torch.save(stage1.state_dict(), os.path.join(RUN_OUTPUT_DIR, "stage1_best.pth"))
+                torch.save(stage2.state_dict(), os.path.join(RUN_OUTPUT_DIR, "stage2_best.pth"))
 
             if _stop_requested:
                 print(f"\n[训练] epoch {epoch+1} 后停止")
@@ -546,8 +546,8 @@ if __name__ == '__main__':
         save_checkpoint_two_stage(stage1, stage2, disc1, disc2, opt_g, opt_d,
             EPOCHS - 1, loss_history, best_loss, CKPT_PATH)
 
-    torch.save(stage1.state_dict(), os.path.join(SAVE_DIR, "stage1_final.pth"))
-    torch.save(stage2.state_dict(), os.path.join(SAVE_DIR, "stage2_final.pth"))
+    torch.save(stage1.state_dict(), os.path.join(RUN_OUTPUT_DIR, "stage1_final.pth"))
+    torch.save(stage2.state_dict(), os.path.join(RUN_OUTPUT_DIR, "stage2_final.pth"))
     update_loss_plot(loss_history, os.path.join(RUN_OUTPUT_DIR, "Loss_two_stage.txt"), RUN_OUTPUT_DIR)
 
     status = "提前停止" if stopped_early else "完成"

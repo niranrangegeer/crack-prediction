@@ -21,14 +21,26 @@ from contextlib import nullcontext
 from datetime import datetime
 
 # 配置
+OUTPUT_ROOT = r"C:\Users\PS\Desktop\crack_prediction\机器学习+裂纹预测\code for my project\outputs"
 SAVE_DIR   = r"C:\Users\PS\Desktop\crack_prediction\机器学习+裂纹预测\code for my project\SaveModel"
-OUTPUT_DIR = r"C:\Users\PS\Desktop\crack_prediction\机器学习+裂纹预测\code for my project\outputs"
 DATA_ROOT  = r"E:\ntop\Abaqus_Plots_v2"
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 USE_AMP = torch.cuda.is_available()
 IMG_SIZE = 256
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# 自动找最新的 two_stage 输出文件夹
+def find_latest_model_dir():
+    """自动找 outputs/ 下最新的 two_stage_v* 文件夹"""
+    candidates = sorted(glob.glob(os.path.join(OUTPUT_ROOT, "two_stage_v*_*")))
+    if not candidates:
+        # fallback: 在 SaveModel 找
+        return SAVE_DIR
+    return candidates[-1]  # 最新的
+
+MODEL_DIR = find_latest_model_dir() if len(sys.argv) < 2 else sys.argv[1]
+print(f"[模型目录] {MODEL_DIR}")
 
 def autocast_ctx():
     return torch.amp.autocast('cuda') if USE_AMP else nullcontext()
@@ -137,12 +149,12 @@ if __name__ == '__main__':
     stage1 = UNetGenerator(in_ch=3, out_ch=3).to(DEVICE)
     stage2 = UNetGenerator(in_ch=6, out_ch=3).to(DEVICE)
 
-    s1_path = os.path.join(SAVE_DIR, "stage1_best.pth")
-    s2_path = os.path.join(SAVE_DIR, "stage2_best.pth")
+    s1_path = os.path.join(MODEL_DIR, "stage1_best.pth")
+    s2_path = os.path.join(MODEL_DIR, "stage2_best.pth")
 
     if not os.path.exists(s1_path):
-        s1_path = os.path.join(SAVE_DIR, "stage1_final.pth")
-        s2_path = os.path.join(SAVE_DIR, "stage2_final.pth")
+        s1_path = os.path.join(MODEL_DIR, "stage1_final.pth")
+        s2_path = os.path.join(MODEL_DIR, "stage2_final.pth")
         print(f"[模型] 使用 final 权重")
     else:
         print(f"[模型] 使用 best 权重")
@@ -200,7 +212,7 @@ if __name__ == '__main__':
 
     plt.suptitle(f'Two-Stage 模型评估 | {TIMESTAMP}', fontsize=10, y=1.01)
     plt.tight_layout(pad=0.5)
-    vis_path = os.path.join(OUTPUT_DIR, f"evaluate_two_stage_{TIMESTAMP}.png")
+    vis_path = os.path.join(MODEL_DIR,f"evaluate_two_stage_{TIMESTAMP}.png")
     plt.savefig(vis_path, dpi=120, bbox_inches='tight')
     plt.close()
     print(f"[可视化] -> {os.path.basename(vis_path)}")
@@ -246,7 +258,7 @@ if __name__ == '__main__':
         print(f"  {mn:<20} {vals.mean():<10.4f} {vals.std():<10.4f} {vals.min():<10.4f} {vals.max():<10.4f}")
 
     # 保存报告
-    report_path = os.path.join(OUTPUT_DIR, f"evaluate_two_stage_report_{TIMESTAMP}.txt")
+    report_path = os.path.join(MODEL_DIR,f"evaluate_two_stage_report_{TIMESTAMP}.txt")
     with open(report_path, 'w') as f:
         f.write(f"两步法模型评估 | {TIMESTAMP}\n")
         f.write(f"测试样本数: {len(all_pairs)}\n\n")
