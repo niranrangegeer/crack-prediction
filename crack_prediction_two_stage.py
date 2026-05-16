@@ -400,8 +400,8 @@ def train_joint(stage1, stage2, disc1, disc2, train_loader,
             g_total = g1_loss + g2_loss
 
         scaler_s1.scale(g_total).backward()
-        scaler_s1.step(opt_s1); scaler_s1.update()
-        scaler_s2.step(opt_s2); scaler_s2.update()
+        scaler_s1.step(opt_s1); scaler_s1.step(opt_s2)
+        scaler_s1.update(); scaler_s2.update()
 
         epoch_g1_loss += g1_loss.item(); epoch_d1_loss += d1_loss.item()
         epoch_g2_loss += g2_loss.item(); epoch_d2_loss += d2_loss.item(); n += 1
