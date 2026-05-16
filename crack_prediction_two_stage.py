@@ -323,30 +323,27 @@ def train_joint(stage1, stage2, disc1, disc2, train_loader,
         geom_t = geom_t.to(DEVICE); sener_t = sener_t.to(DEVICE)
         status_t = status_t.to(DEVICE)
 
-        # ---- Train Disc1 (Sener) ----
-        opt_d1.zero_grad()
+        # ---- Train Discriminators (联合 backward，共用 opt_d) ----
+        opt_d1.zero_grad(); opt_d2.zero_grad()
         with autocast():
             fake_sener = stage1(geom_t)
             d1_real = disc1(geom_t, sener_t)
             d1_fake = disc1(geom_t, fake_sener.detach())
             d1_loss = (criterion_gan(d1_real, torch.ones_like(d1_real)) +
                        criterion_gan(d1_fake, torch.zeros_like(d1_fake))) * 0.5
-        scaler_d.scale(d1_loss).backward()
-        scaler_d.step(opt_d1)
 
-        # ---- Train Disc2 (Crack) ----
-        cond2 = torch.cat([geom_t, fake_sener.detach()], dim=1)
-        opt_d2.zero_grad()
-        with autocast():
-            fake_status = stage2(cond2)
+            cond2 = torch.cat([geom_t, fake_sener.detach()], dim=1)
+            fake_status_d = stage2(cond2)
             d2_real = disc2(torch.cat([geom_t, sener_t], dim=1), status_t)
-            d2_fake = disc2(cond2, fake_status.detach())
+            d2_fake = disc2(cond2, fake_status_d.detach())
             d2_loss = (criterion_gan(d2_real, torch.ones_like(d2_real)) +
                        criterion_gan(d2_fake, torch.zeros_like(d2_fake))) * 0.5
-        scaler_d.scale(d2_loss).backward()
-        scaler_d.step(opt_d2); scaler_d.update()
 
-        # ---- Train Stage1 + Stage2 (Joint Generator) ----
+            d_total = d1_loss + d2_loss
+        scaler_d.scale(d_total).backward()
+        scaler_d.step(opt_d1); scaler_d.update()
+
+        # ---- Train Stage1 + Stage2 (联合 backward，共用 opt_g) ----
         opt_s1.zero_grad(); opt_s2.zero_grad()
         with autocast():
             fake_sener = stage1(geom_t)
@@ -365,10 +362,10 @@ def train_joint(stage1, stage2, disc1, disc2, train_loader,
             g_total = g1_loss + g2_loss
 
         scaler_g.scale(g_total).backward()
-        scaler_g.step(opt_s1); scaler_g.step(opt_s2); scaler_g.update()
+        scaler_g.step(opt_s1); scaler_g.update()
 
         epoch_g_loss += g_total.item(); epoch_s_loss += g1_loss.item()
-        epoch_d_loss += (d1_loss.item() + d2_loss.item()); n += 1
+        epoch_d_loss += d_total.item(); n += 1
 
     return (epoch_s_loss / max(n, 1), epoch_d_loss / max(n, 1),
             epoch_g_loss / max(n, 1))
