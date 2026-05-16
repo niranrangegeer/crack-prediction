@@ -314,7 +314,7 @@ def train_stage2(stage1, stage2, disc2, train_loader, opt_g, opt_d, scaler_g, sc
             fake_status = stage2(cond)
             d_fake = disc2(cond, fake_status)
             weight_mask = torch.ones_like(status_t)
-            weight_mask[status_t < 0.0] = 20.0
+            weight_mask[status_t < 0.0] = 5.0
             l1_weighted = torch.mean(torch.abs(fake_status - status_t) * weight_mask) * 100.0
             g_loss = criterion_gan(d_fake, torch.ones_like(d_fake)) + l1_weighted
         scaler_g.scale(g_loss).backward()
@@ -368,7 +368,7 @@ def train_joint(stage1, stage2, disc1, disc2, train_loader,
                       criterion_l1(fake_sener, sener_t) * 100.0
 
             weight_mask = torch.ones_like(status_t)
-            weight_mask[status_t < 0.0] = 20.0
+            weight_mask[status_t < 0.0] = 5.0
             l1_weighted = torch.mean(torch.abs(fake_status - status_t) * weight_mask) * 100.0
             g2_loss = criterion_gan(disc2(torch.cat([geom_t, fake_sener], dim=1), fake_status),
                                     torch.ones(1, device=DEVICE).expand_as(d2_real)) + l1_weighted
@@ -491,7 +491,7 @@ if __name__ == '__main__':
     start_epoch, loss_history, best_loss = load_checkpoint_two_stage(
         stage1, stage2, disc1, disc2, opt_g, opt_d, CKPT_PATH)
 
-    EPOCHS = 400
+    EPOCHS = 1200
     print(f"\n[训练] 设备: {DEVICE}  |  Epochs: {EPOCHS}  |  Batch: {BATCH_SIZE}")
     print(f"[训练] 从 epoch {start_epoch + 1} 开始\n")
 
