@@ -500,13 +500,8 @@ if __name__ == '__main__':
     stage2 = UNetGenerator(in_ch=6, out_ch=3).to(DEVICE)
     disc2  = PatchGANDiscriminator(in_ch=9).to(DEVICE)   # 条件Geom+Sener(6)+目标Status(3)
 
-    # torch.compile
-    if hasattr(torch, 'compile'):
-        print("[优化] torch.compile 加速...")
-        stage1 = torch.compile(stage1, mode="reduce-overhead")
-        stage2 = torch.compile(stage2, mode="reduce-overhead")
-        disc1  = torch.compile(disc1, mode="reduce-overhead")
-        disc2  = torch.compile(disc2, mode="reduce-overhead")
+    # torch.compile 在 Windows 上不可用 (Triton 不支持 Windows)
+    # AMP 混合精度已经提供足够加速，去掉 compile 不影响训练速度
 
     criterion_gan = nn.MSELoss()
     criterion_l1  = nn.L1Loss()
