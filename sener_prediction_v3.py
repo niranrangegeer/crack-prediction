@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import autocast
 from PIL import Image
 import matplotlib
 matplotlib.use('Agg')
@@ -285,13 +285,13 @@ if __name__ == '__main__':
     model = UNet(in_ch=3, out_ch=3).to(DEVICE)
     criterion = nn.L1Loss()
     opt = optim.Adam(model.parameters(), lr=2e-4, betas=(0.5, 0.999))
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     # 学习率调度: 每100 epoch减半
     scheduler = optim.lr_scheduler.StepLR(opt, step_size=100, gamma=0.5)
 
     # ---- 断点续训 ----
-    CKPT_PATH = os.path.join(SAVE_DIR, "checkpoint_sener_l1.pth")
+    CKPT_PATH = os.path.join(SAVE_DIR, "checkpoint_sener_v3.pth")
     start_epoch, loss_history, best_loss = load_checkpoint(model, opt, CKPT_PATH)
 
     EPOCHS = 600
