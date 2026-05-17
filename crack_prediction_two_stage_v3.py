@@ -235,8 +235,10 @@ def load_checkpoint_two_stage(stage1, stage2, disc1, disc2, opt_g, opt_d, path):
         return 0, [], float('inf')
     ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
     stage1.load_state_dict(ckpt['stage1']); stage2.load_state_dict(ckpt['stage2'])
-    disc1.load_state_dict(ckpt['disc1']); disc2.load_state_dict(ckpt['disc2'])
-    opt_g.load_state_dict(ckpt['opt_g']); opt_d.load_state_dict(ckpt['opt_d'])
+    # 兼容部分断点：disc/opt 可能为 None（从已有权重续训时）
+    for key, model in [('disc1', disc1), ('disc2', disc2), ('opt_g', opt_g), ('opt_d', opt_d)]:
+        if ckpt.get(key) is not None:
+            model.load_state_dict(ckpt[key])
     start_epoch = ckpt['epoch'] + 1
     loss_history = ckpt.get('loss_history', [])
     best_loss = ckpt.get('best_loss', float('inf'))
